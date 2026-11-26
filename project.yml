@@ -1,0 +1,24 @@
+
+name: BracketCam
+
+options:
+  bundleIdPrefix: it.bracketcam
+
+targets:
+  BracketCam:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: BracketCamApp.swift
+      - path: ContentView.swift
+      - path: CameraModel.swift
+      - path: Fusion.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: it.bracketcam.personal
+        PRODUCT_NAME: BracketCam
+        SWIFT_VERSION: 5.0
+        INFOPLIST_KEY_NSCameraUsageDescription: "Serve per scattare le foto"
+        INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: "Serve per salvare le foto"
+        TARGETED_DEVICE_FAMILY: "1"
