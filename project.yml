@@ -1,4 +1,3 @@
-
 name: BracketCam
 
 options:
@@ -21,4 +20,3 @@ targets:
         SWIFT_VERSION: 5.0
         INFOPLIST_KEY_NSCameraUsageDescription: "Serve per scattare le foto"
         INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: "Serve per salvare le foto"
-        TARGETED_DEVICE_FAMILY: "1"
