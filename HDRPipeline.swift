@@ -7,7 +7,7 @@ import UniformTypeIdentifiers
 // Pipeline completa: decodifica -> allineamento -> fusione Mertens -> finitura -> export con EXIF.
 // Tutto offline, solo framework di sistema.
 
-nonisolated struct HDROptions {
+struct HDROptions {
     var heif = false                       // false = JPEG, true = HEIF
     var quality: Double = 0.95
     var maxLongSide = 4032                 // lato lungo massimo di lavoro (12 MP dell'iPhone)
@@ -17,9 +17,9 @@ nonisolated struct HDROptions {
     var core = FCParams()
 }
 
-nonisolated enum HDRPipeline {
+enum HDRPipeline {
 
-    nonisolated struct Info { let w: Int; let h: Int; let props: [String: Any]? }
+    struct Info { let w: Int; let h: Int; let props: [String: Any]? }
 
     /// Fonde gli scatti AEB in una sola immagine. Restituisce i byte JPEG/HEIF oppure nil in caso di errore.
     nonisolated static func process(_ datas: [Data], options: HDROptions = HDROptions()) -> Data? {
