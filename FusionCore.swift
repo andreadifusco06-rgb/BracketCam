@@ -53,8 +53,12 @@ struct FCParams {
     var wbStrength: Float = 0.5
     var wbMaxGain: Float = 1.14
     var autoLevel = true
-    var targetMedian: Float = 0.48
-    var contrast: Float = 0.2
+    var whitePoint = true
+    var targetWhite: Float = 0.96           // dove porta il 99,5% più chiaro (pareti bianche non grigie)
+    var targetBlack: Float = 0.015
+    var targetMedian: Float = 0.48          // solleva i mezzi toni se più scuri
+    var maxMedian: Float = 0.58             // e li abbassa se più chiari
+    var contrast: Float = 0.3
 }
 
 // MARK: - Motore
@@ -416,6 +420,356 @@ enum FC {
     nonisolated static func shifted(_ f: RGBA8, _ dx: Int, _ dy: Int) -> RGBA8 {
         if dx == 0 && dy == 0 { return f }
         let w = f.w, h = f.h
+        let out = RGBA8(w, h)
+        let sp = f.p, op = out.p
+        parallelFor(h) { y in
+            let sy = min(max(y - dy, 0), h - 1)
+            for x in 0..<w {
+                let sx = min(max(x - dx, 0), w - 1)
+                let si = (sy * w + sx) * 4
+                let oi = (y * w + x) * 4
+                op[oi] = sp[si]; op[oi + 1] = sp[si + 1]; op[oi + 2] = sp[si + 2]; op[oi + 3] = 255
+            }
+        }
+        withExtendedLifetime(f) {}
+        return out
+    }
+
+    // MARK: deghosting (riduce il peso dei frame dove qualcosa si è mosso)
+
+    nonisolated static let ghostScale = 4
+
+    nonisolated static func smallGray(_ f: RGBA8) -> FImg {
+        let s = ghostScale
+        let sw = max(1, f.w / s), sh = max(1, f.h / s)
+        let out = FImg(sw, sh, 1)
+        let fp = f.p, op = out.p
+        let fw = f.w, fh = f.h
+        let norm: Float = 1.0 / (Float(s * s) * 255.0)
+        parallelFor(sh) { y in
+            for x in 0..<sw {
+                var acc: Float = 0
+                for yy in 0..<s {
+                    let py = min(y * s + yy, fh - 1)
+                    for xx in 0..<s {
+                        let px = min(x * s + xx, fw - 1)
+                        let i = (py * fw + px) * 4
+                        acc += 0.299 * Float(fp[i]) + 0.587 * Float(fp[i + 1]) + 0.114 * Float(fp[i + 2])
+                    }
+                }
+                op[y * sw + x] = acc * norm
+            }
+        }
+        withExtendedLifetime(f) {}
+        return out
+    }
+
+    nonisolated static func cdf(_ a: FImg, _ bins: Int) -> [Float] {
+        var hst = [Float](repeating: 0, count: bins)
+        let n = a.w * a.h
+        for i in 0..<n {
+            let b = min(bins - 1, max(0, Int(a.p[i] * Float(bins))))
+            hst[b] += 1
+        }
+        var acc: Float = 0
+        let inv = 1.0 / Float(max(n, 1))
+        for b in 0..<bins { acc += hst[b]; hst[b] = acc * inv }
+        return hst
+    }
+
+    nonisolated static func median(_ v: [Float]) -> Float {
+        if v.isEmpty { return 0 }
+        var s = v
+        s.sort()
+        return s[s.count / 2]
+    }
+
+    /// Per ogni frame diverso dal riferimento restituisce una mappa piccola (1 = tiene, ~0 = fantasma).
+    nonisolated static func ghostMaps(_ fr: [RGBA8], ref: Int, k: Float) -> [FImg?] {
+        let n = fr.count
+        var out = [FImg?](repeating: nil, count: n)
+        let r = smallGray(fr[ref])
+        let bins = 1024
+        let cdfR = cdf(r, bins)
+        let cnt = r.w * r.h
+        for i in 0..<n where i != ref {
+            let f = smallGray(fr[i])
+            let cdfF = cdf(f, bins)
+            var lut = [Float](repeating: 0, count: bins)
+            var j = 0
+            for b in 0..<bins {
+                while j < bins - 1 && cdfF[j] < cdfR[b] { j += 1 }
+                lut[b] = (Float(j) + 0.5) / Float(bins)
+            }
+            var res = [Float](repeating: 0, count: cnt)
+            for q in 0..<cnt {
+                let bi = min(bins - 1, max(0, Int(r.p[q] * Float(bins))))
+                res[q] = abs(f.p[q] - lut[bi])
+            }
+            let med = median(res)
+            var dev = [Float](repeating: 0, count: cnt)
+            for q in 0..<cnt { dev[q] = abs(res[q] - med) }
+            let mad = median(dev) + 1e-4
+            let thr = med + k * 1.4826 * mad
+            let mask = FImg(r.w, r.h, 1)
+            for q in 0..<cnt {
+                let rv = r.p[q], fv = f.p[q]
+                let valid = rv > 0.05 && rv < 0.95 && fv > 0.03 && fv < 0.97
+                mask.p[q] = (res[q] > thr && valid) ? 1 : 0
+            }
+            boxBlurOnce(mask.p, mask.w, mask.h, 3)
+            for q in 0..<cnt {
+                let m = min(1, mask.p[q] * 3)
+                mask.p[q] = 1 - 0.97 * m
+            }
+            out[i] = mask
+        }
+        return out
+    }
+
+    /// Moltiplica la mappa dei pesi per la mappa fantasmi (interpolazione bilineare).
+    nonisolated static func applyMult(_ wmap: FImg, _ m: FImg) {
+        let w = wmap.w, h = wmap.h, sw = m.w, sh = m.h
+        let wp = wmap.p, mp = m.p
+        let scale = Float(ghostScale)
+        parallelFor(h) { y in
+            let fy = min(max((Float(y) + 0.5) / scale - 0.5, 0), Float(sh - 1))
+            let y0 = Int(fy), y1 = min(y0 + 1, sh - 1)
+            let ty = fy - Float(y0)
+            for x in 0..<w {
+                let fx = min(max((Float(x) + 0.5) / scale - 0.5, 0), Float(sw - 1))
+                let x0 = Int(fx), x1 = min(x0 + 1, sw - 1)
+                let tx = fx - Float(x0)
+                let a: Float = mp[y0 * sw + x0] * (1 - tx) + mp[y0 * sw + x1] * tx
+                let b: Float = mp[y1 * sw + x0] * (1 - tx) + mp[y1 * sw + x1] * tx
+                wp[y * w + x] *= a * (1 - ty) + b * ty
+            }
+        }
+        withExtendedLifetime(wmap) {}
+        withExtendedLifetime(m) {}
+    }
+
+    // MARK: fusione di Mertens
+
+    nonisolated static func levelCount(_ w: Int, _ h: Int) -> Int {
+        let m = Float(min(w, h)) / 8.0
+        return max(1, min(8, Int(log2(max(m, 2)))))
+    }
+
+    /// Fusione a piramide di Laplace, un frame alla volta per contenere la memoria.
+    /// I frame devono essere già allineati. Restituisce RGB float 0...1.
+    nonisolated static func fuse(_ fr: [RGBA8], ref: Int, _ prm: FCParams) -> FImg {
+        let w = fr[0].w, h = fr[0].h, n = fr.count
+        let L = levelCount(w, h)
+        let sigma = prm.weightBlurFraction * Float(w)
+
+        let ghosts: [FImg?] = (prm.deghost && n > 1) ? ghostMaps(fr, ref: ref, k: prm.ghostK)
+                                                        : [FImg?](repeating: nil, count: n)
+
+        // 1) pesi di tutti i frame + somma per la normalizzazione
+        var wm = [FImg?](repeating: nil, count: n)
+        let sum = FImg(w, h, 1)
+        for i in 0..<n {
+            let wi = weightMap(fr[i], prm)
+            gaussApprox(wi.p, w, h, sigma: sigma)
+            if let g = ghosts[i] { applyMult(wi, g) }
+            let sp = sum.p, ip = wi.p
+            parallelFor(h) { y in
+                for x in 0..<w { sp[y * w + x] += ip[y * w + x] }
+            }
+            withExtendedLifetime(wi) {}
+            wm[i] = wi
+        }
+
+        // dimensioni dei livelli
+        var dims: [(Int, Int)] = [(w, h)]
+        for _ in 0..<L {
+            let last = dims[dims.count - 1]
+            dims.append(((last.0 + 1) / 2, (last.1 + 1) / 2))
+        }
+        var acc: [FImg] = dims.map { FImg($0.0, $0.1, 3) }
+
+        // 2) accumulo dei contributi di ogni frame
+        for i in 0..<n {
+            let wi = wm[i]!
+            let sp = sum.p, ip = wi.p
+            parallelFor(h) { y in
+                for x in 0..<w { ip[y * w + x] /= (sp[y * w + x] + 1e-20) }
+            }
+            let img = toFloat(fr[i])
+            var gi: [FImg] = [img]
+            var gw: [FImg] = [wi]
+            for _ in 0..<L {
+                gi.append(pyrDown(gi[gi.count - 1]))
+                gw.append(pyrDown(gw[gw.count - 1]))
+            }
+            for lv in 0..<L {
+                let up = pyrUp(gi[lv + 1], gi[lv].w, gi[lv].h)
+                let lw = gi[lv].w, lh = gi[lv].h
+                let ap = acc[lv].p, gp = gi[lv].p, upp = up.p, wp = gw[lv].p
+                parallelFor(lh) { y in
+                    for x in 0..<lw {
+                        let q = y * lw + x
+                        let wt = wp[q]
+                        ap[q * 3] += (gp[q * 3] - upp[q * 3]) * wt
+                        ap[q * 3 + 1] += (gp[q * 3 + 1] - upp[q * 3 + 1]) * wt
+                        ap[q * 3 + 2] += (gp[q * 3 + 2] - upp[q * 3 + 2]) * wt
+                    }
+                }
+                withExtendedLifetime(up) {}
+                withExtendedLifetime(gi[lv]) {}
+                withExtendedLifetime(gw[lv]) {}
+            }
+            // livello più grossolano: immagine gaussiana pesata
+            let top = L
+            let tw = gi[top].w, th = gi[top].h
+            let atp = acc[top].p, gtp = gi[top].p, wtp = gw[top].p
+            parallelFor(th) { y in
+                for x in 0..<tw {
+                    let q = y * tw + x
+                    let wt = wtp[q]
+                    atp[q * 3] += gtp[q * 3] * wt
+                    atp[q * 3 + 1] += gtp[q * 3 + 1] * wt
+                    atp[q * 3 + 2] += gtp[q * 3 + 2] * wt
+                }
+            }
+            withExtendedLifetime(gi[top]) {}
+            withExtendedLifetime(gw[top]) {}
+            wm[i] = nil
+        }
+        withExtendedLifetime(sum) {}
+
+        // 3) ricostruzione
+        var cur = acc[L]
+        var lv = L - 1
+        while lv >= 0 {
+            let up = pyrUp(cur, acc[lv].w, acc[lv].h)
+            let cnt = up.w * up.h * 3
+            let upp = up.p, ap = acc[lv].p
+            parallelFor(up.h) { y in
+                let base = y * up.w * 3
+                for i in 0..<(up.w * 3) { upp[base + i] += ap[base + i] }
+            }
+            _ = cnt
+            withExtendedLifetime(acc[lv]) {}
+            cur = up
+            acc[lv] = FImg(1, 1, 3)   // libera il livello già usato
+            lv -= 1
+        }
+        let result = cur
+        let o = result.p
+        let rw = result.w, rh = result.h
+        parallelFor(rh) { y in
+            let base = y * rw * 3
+            for i in 0..<(rw * 3) { o[base + i] = min(max(o[base + i], 0), 1) }
+        }
+        withExtendedLifetime(result) {}
+        return result
+    }
+
+    // MARK: finitura
+
+    @inline(__always)
+    nonisolated static func rnd(_ i: Int, _ k: UInt32) -> Float {
+        var x = UInt32(truncatingIfNeeded: i) &* 2654435761 &+ k &* 40503
+        x ^= x >> 15
+        x = x &* 2246822519
+        x ^= x >> 13
+        x = x &* 3266489917
+        x ^= x >> 16
+        return Float(x & 0xFFFF) * (1.0 / 65536.0)
+    }
+
+    /// Bilanciamento del bianco prudente, livello automatico, contrasto morbido, conversione a 8 bit con dithering.
+    nonisolated static func finish(_ img: FImg, _ prm: FCParams) -> RGBA8 {
+        let w = img.w, h = img.h
+        let ip = img.p
+        var gains: [Float] = [1, 1, 1]
+
+        // bilanciamento del bianco: grigio medio sui pixel neutri e a tono medio
+        if prm.whiteBalance {
+            var sumC: [Double] = [0, 0, 0]
+            var cnt = 0, total = 0
+            var y = 0
+            while y < h {
+                var x = 0
+                while x < w {
+                    let i = (y * w + x) * 3
+                    let r = ip[i], g = ip[i + 1], b = ip[i + 2]
+                    let m = (r + g + b) / 3
+                    let mx = max(r, max(g, b)), mn = min(r, min(g, b))
+                    let sat = (mx - mn) / (mx + 1e-6)
+                    if m > 0.2 && m < 0.85 && sat < 0.35 {
+                        sumC[0] += Double(r); sumC[1] += Double(g); sumC[2] += Double(b)
+                        cnt += 1
+                    }
+                    total += 1
+                    x += 3
+                }
+                y += 3
+            }
+            if cnt > total / 100 {
+                let mr = Float(sumC[0] / Double(cnt)), mg = Float(sumC[1] / Double(cnt)), mb = Float(sumC[2] / Double(cnt))
+                let avg = (mr + mg + mb) / 3
+                let raw: [Float] = [avg / max(mr, 1e-4), avg / max(mg, 1e-4), avg / max(mb, 1e-4)]
+                let lo = 1 / prm.wbMaxGain
+                for c in 0..<3 {
+                    gains[c] = min(max(pow(raw[c], prm.wbStrength), lo), prm.wbMaxGain)
+                }
+            }
+        }
+
+        // livello automatico: punto di nero/bianco dall'istogramma, poi mezzi toni
+        var gamma: Float = 1
+        var lo: Float = 0
+        var k: Float = 1
+        var outLo: Float = 0
+        if prm.autoLevel {
+            var hst = [Int](repeating: 0, count: 1024)
+            var count = 0
+            var y = 0
+            while y < h {
+                var x = 0
+                while x < w {
+                    let i = (y * w + x) * 3
+                    let l = (ip[i] * gains[0] + ip[i + 1] * gains[1] + ip[i + 2] * gains[2]) / 3
+                    hst[min(1023, max(0, Int(l * 1023)))] += 1
+                    count += 1
+                    x += 3
+                }
+                y += 3
+            }
+            var acc = 0
+            var loBin = 0, medBin = 512, hiBin = 1023
+            var gotLo = false, gotMed = false, gotHi = false
+            for b in 0..<1024 {
+                acc += hst[b]
+                if !gotLo && Double(acc) >= 0.002 * Double(count) { loBin = b; gotLo = true }
+                if !gotMed && acc * 2 >= count { medBin = b; gotMed = true }
+                if !gotHi && Double(acc) >= 0.995 * Double(count) { hiBin = b; gotHi = true }
+            }
+            if prm.whitePoint {
+                let l0 = min(Float(loBin) / 1023, 0.06)
+                let h0 = max(Float(hiBin + 1) / 1023, 0.75)
+                if h0 > l0 + 0.2 {
+                    let kk = (prm.targetWhite - prm.targetBlack) / (h0 - l0)
+                    if kk > 1 { lo = l0; outLo = prm.targetBlack; k = kk }   // solo allunga, non scurisce
+                }
+            }
+            let medIn = max((Float(medBin) + 0.5) / 1023, 0.02)
+            let medS = min(max((medIn - lo) * k + outLo, 0.02), 0.98)
+            if medS < prm.targetMedian {
+                gamma = min(max(log(prm.targetMedian) / log(medS), 0.7), 1.0)
+            } else if medS > prm.maxMedian {
+                gamma = min(max(log(prm.maxMedian) / log(medS), 1.0), 1.25)
+            }
+        }
+        var lut = [Float](repeating: 0, count: 4096)
+        for i in 0..<4096 {
+            let v = min(max((Float(i) / 4095 - lo) * k + outLo, 0), 1)
+            lut[i] = pow(v, gamma)
+        }
+
         let out = RGBA8(w, h)
         let sp = f.p, op = out.p
         parallelFor(h) { y in
