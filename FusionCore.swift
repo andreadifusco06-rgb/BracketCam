@@ -4,12 +4,12 @@ import Foundation
 // allineamento MTB, deghosting prudente e finitura. Solo Foundation, nessuna dipendenza esterna.
 // Tutti i parametri sono in `FCParams`, tarati con un prototipo di riferimento (numpy/OpenCV).
 //
-// Richiede Xcode 16.3 o successivo (annotazione `nonisolated` sui tipi).
+// Compatibile con Swift 5 e Swift 6.
 
 // MARK: - Buffer
 
 /// Immagine float a canali interleaved. Memoria gestita a mano per evitare copie.
-nonisolated final class FImg {
+final class FImg {
     let w: Int
     let h: Int
     let c: Int
@@ -24,7 +24,7 @@ nonisolated final class FImg {
 }
 
 /// Immagine 8 bit RGBX (4 byte per pixel, il quarto byte è ignorato).
-nonisolated final class RGBA8 {
+final class RGBA8 {
     let w: Int
     let h: Int
     let p: UnsafeMutablePointer<UInt8>
@@ -39,7 +39,7 @@ nonisolated final class RGBA8 {
 
 // MARK: - Parametri
 
-nonisolated struct FCParams {
+struct FCParams {
     // Pesi di Mertens: contrasto * saturazione * esposizione ben centrata.
     var wellExposedCenter: Float = 0.6      // centro della gaussiana di "buona esposizione"
     var wellExposedSigma: Float = 0.2
@@ -59,7 +59,7 @@ nonisolated struct FCParams {
 
 // MARK: - Motore
 
-nonisolated enum FC {
+enum FC {
 
     // MARK: parallelismo
 
@@ -775,4 +775,5 @@ nonisolated enum FC {
         withExtendedLifetime(img) {}
         return out
     }
+}
 }
