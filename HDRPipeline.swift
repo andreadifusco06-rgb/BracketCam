@@ -1,164 +1,427 @@
+
 import Foundation
 import CoreGraphics
 import CoreImage
 import ImageIO
 import UniformTypeIdentifiers
 
-// Pipeline completa: decodifica -> allineamento -> fusione Mertens -> finitura -> export con EXIF.
-// Tutto offline, solo framework di sistema.
-
 struct HDROptions {
-    var heif = false                       // false = JPEG, true = HEIF
-    var quality: Double = 0.95
-    var maxLongSide = 4032                 // lato lungo massimo di lavoro (12 MP dell'iPhone)
-    var maxTotalPixels = 62_000_000        // tetto di memoria: n scatti x pixel
-    var denoise: Float = 0.015             // 0 = spento (CINoiseReduction)
-    var sharpen: Float = 0.35              // 0 = spento (CISharpenLuminance)
+    var heif = false
+    var quality: Double = 0.97
+
+    // Risoluzione di elaborazione sicura
+    var maxLongSide = 4032
+    var maxTotalPixels = 62_000_000
+
+    // Riduzione rumore e nitidezza conservative
+    var denoise: Float = 0.008
+    var sharpen: Float = 0.25
+
+    // Parametri di fusione
     var core = FCParams()
 }
 
 enum HDRPipeline {
 
-    struct Info { let w: Int; let h: Int; let props: [String: Any]? }
+    struct Info {
+        let w: Int
+        let h: Int
+        let props: [String: Any]?
+    }
 
-    /// Fonde gli scatti AEB in una sola immagine. Restituisce i byte JPEG/HEIF oppure nil in caso di errore.
-    nonisolated static func process(_ datas: [Data], options: HDROptions = HDROptions()) -> Data? {
-        guard datas.count >= 2, let first = info(datas[0]) else { return nil }
+    nonisolated static func process(
+        _ datas: [Data],
+        options: HDROptions = HDROptions()
+    ) -> Data? {
+
+        guard datas.count >= 2,
+              let first = info(datas[0]) else {
+            return nil
+        }
+
         let n = datas.count
 
-        // tetto di risoluzione: lato lungo e memoria totale
-        var maxSide = min(options.maxLongSide, max(first.w, first.h))
-        let total = Double(n) * Double(first.w) * Double(first.h)
-        if total > Double(options.maxTotalPixels) {
-            let k = (Double(options.maxTotalPixels) / total).squareRoot()
-            maxSide = min(maxSide, Int(Double(max(first.w, first.h)) * k))
+        // Calcolo della risoluzione di elaborazione
+        var maxSide = min(
+            options.maxLongSide,
+            max(first.w, first.h)
+        )
+
+        let totalPixels =
+            Double(n) *
+            Double(first.w) *
+            Double(first.h)
+
+        if totalPixels > Double(options.maxTotalPixels) {
+            let scale = (
+                Double(options.maxTotalPixels) / totalPixels
+            ).squareRoot()
+
+            maxSide = min(
+                maxSide,
+                Int(Double(max(first.w, first.h)) * scale)
+            )
         }
+
         maxSide = max(maxSide, 256)
 
-        // 1) decodifica (orientamento applicato, spazio Display P3)
+        // Decodifica immagini
         var frames: [RGBA8] = []
-        var props: [[String: Any]?] = []
-        for d in datas {
+        var properties: [[String: Any]?] = []
+
+        for data in datas {
             autoreleasepool {
-                if let f = decode(d, maxSide: maxSide) {
-                    if frames.isEmpty || (f.w == frames[0].w && f.h == frames[0].h) {
-                        frames.append(f)
-                        props.append(info(d)?.props)
+                if let frame = decode(data, maxSide: maxSide) {
+                    if frames.isEmpty ||
+                        (frame.w == frames[0].w &&
+                         frame.h == frames[0].h) {
+
+                        frames.append(frame)
+                        properties.append(info(data)?.props)
                     }
                 }
             }
         }
-        guard frames.count >= 2 else { return nil }
 
-        // 2) riferimento + allineamento MTB
-        let ref = FC.refIndex(frames)
-        let w = frames[0].w, h = frames[0].h
-        let grayRef = FC.grayU8(frames[ref])
-        for i in 0..<frames.count where i != ref {
-            let g = FC.grayU8(frames[i])
-            let (dx, dy) = FC.mtbShift(ref: grayRef, mov: g, w: w, h: h)
+        guard frames.count >= 2 else {
+            return nil
+        }
+
+        // Allineamento MTB
+        let reference = FC.refIndex(frames)
+
+        let width = frames[0].w
+        let height = frames[0].h
+
+        let referenceGray = FC.grayU8(frames[reference])
+
+        for index in 0..<frames.count where index != reference {
+            let gray = FC.grayU8(frames[index])
+
+            let (dx, dy) = FC.mtbShift(
+                ref: referenceGray,
+                mov: gray,
+                w: width,
+                h: height
+            )
+
             if dx != 0 || dy != 0 {
-                frames[i] = FC.shifted(frames[i], dx, dy)
+                frames[index] = FC.shifted(
+                    frames[index],
+                    dx,
+                    dy
+                )
             }
         }
 
-        // 3) fusione + 4) finitura
-        let fused = FC.fuse(frames, ref: ref, options.core)
-        frames.removeAll()
-        let result = FC.finish(fused, options.core)
+        // Fusione HDR Mertens
+        let fused = FC.fuse(
+            frames,
+            ref: reference,
+            options.core
+        )
 
-        // 5) esportazione
-        return export(result, props: props[ref], options: options)
+        frames.removeAll()
+
+        // Finitura colore e luminosità
+        let result = FC.finish(
+            fused,
+            options.core
+        )
+
+        // Esportazione
+        return export(
+            result,
+            props: properties[reference],
+            options: options
+        )
     }
 
-    // MARK: decodifica
+    // MARK: - Informazioni immagine
 
     nonisolated static func info(_ data: Data) -> Info? {
-        guard let src = CGImageSourceCreateWithData(data as CFData, nil),
-              let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [String: Any] else { return nil }
-        let pw = (p[kCGImagePropertyPixelWidth as String] as? NSNumber)?.intValue ?? 0
-        let ph = (p[kCGImagePropertyPixelHeight as String] as? NSNumber)?.intValue ?? 0
-        guard pw > 0, ph > 0 else { return nil }
-        return Info(w: pw, h: ph, props: p)
+
+        guard let source = CGImageSourceCreateWithData(
+            data as CFData,
+            nil
+        ),
+        let properties = CGImageSourceCopyPropertiesAtIndex(
+            source,
+            0,
+            nil
+        ) as? [String: Any] else {
+            return nil
+        }
+
+        let width = (
+            properties[kCGImagePropertyPixelWidth as String]
+            as? NSNumber
+        )?.intValue ?? 0
+
+        let height = (
+            properties[kCGImagePropertyPixelHeight as String]
+            as? NSNumber
+        )?.intValue ?? 0
+
+        guard width > 0, height > 0 else {
+            return nil
+        }
+
+        return Info(
+            w: width,
+            h: height,
+            props: properties
+        )
     }
 
-    nonisolated static func decode(_ data: Data, maxSide: Int) -> RGBA8? {
-        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
-        let opts: [CFString: Any] = [
+    // MARK: - Decodifica
+
+    nonisolated static func decode(
+        _ data: Data,
+        maxSide: Int
+    ) -> RGBA8? {
+
+        guard let source = CGImageSourceCreateWithData(
+            data as CFData,
+            nil
+        ) else {
+            return nil
+        }
+
+        let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceShouldCacheImmediately: true,
             kCGImageSourceThumbnailMaxPixelSize: maxSide
         ]
-        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary),
-              let cs = CGColorSpace(name: CGColorSpace.displayP3) else { return nil }
-        let out = RGBA8(cg.width, cg.height)
-        guard let ctx = CGContext(data: out.p, width: cg.width, height: cg.height,
-                                  bitsPerComponent: 8, bytesPerRow: cg.width * 4, space: cs,
-                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
-        ctx.interpolationQuality = .high
-        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: cg.width, height: cg.height))
-        return out
+
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(
+            source,
+            0,
+            options as CFDictionary
+        ),
+        let colorSpace = CGColorSpace(
+            name: CGColorSpace.displayP3
+        ) else {
+            return nil
+        }
+
+        let output = RGBA8(
+            cgImage.width,
+            cgImage.height
+        )
+
+        guard let context = CGContext(
+            data: output.p,
+            width: cgImage.width,
+            height: cgImage.height,
+            bitsPerComponent: 8,
+            bytesPerRow: cgImage.width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ) else {
+            return nil
+        }
+
+        context.interpolationQuality = .high
+
+        context.draw(
+            cgImage,
+            in: CGRect(
+                x: 0,
+                y: 0,
+                width: cgImage.width,
+                height: cgImage.height
+            )
+        )
+
+        return output
     }
 
-    // MARK: esportazione
+    // MARK: - Finitura fotografica
 
-    nonisolated static func export(_ img: RGBA8, props: [String: Any]?, options: HDROptions) -> Data? {
-        guard let cs = CGColorSpace(name: CGColorSpace.displayP3),
-              let ctx = CGContext(data: img.p, width: img.w, height: img.h,
-                                  bitsPerComponent: 8, bytesPerRow: img.w * 4, space: cs,
-                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
-              let base = ctx.makeImage() else { return nil }
+    nonisolated static func enhance(
+        _ image: CGImage,
+        options: HDROptions,
+        colorSpace: CGColorSpace
+    ) -> CGImage {
 
-        // rifinitura con Core Image: riduzione del rumore leggera + nitidezza sulla sola luminanza
-        var outImg = base
-        if options.denoise > 0 || options.sharpen > 0 {
-            var ci = CIImage(cgImage: base)
-            if options.denoise > 0, let f = CIFilter(name: "CINoiseReduction") {
-                f.setValue(ci, forKey: kCIInputImageKey)
-                f.setValue(options.denoise, forKey: "inputNoiseLevel")
-                f.setValue(0.2, forKey: "inputSharpness")
-                if let o = f.outputImage { ci = o }
-            }
-            if options.sharpen > 0, let f = CIFilter(name: "CISharpenLuminance") {
-                f.setValue(ci, forKey: kCIInputImageKey)
-                f.setValue(options.sharpen, forKey: "inputSharpness")
-                if let o = f.outputImage { ci = o }
-            }
-            let cictx = CIContext(options: [.workingColorSpace: cs, .outputColorSpace: cs])
-            let rect = CGRect(x: 0, y: 0, width: img.w, height: img.h)
-            if let rendered = cictx.createCGImage(ci, from: rect, format: .RGBA8, colorSpace: cs) {
-                outImg = rendered
+        var current = CIImage(cgImage: image)
+
+        // Riduzione rumore leggera
+        if options.denoise > 0,
+           let filter = CIFilter(name: "CINoiseReduction") {
+
+            filter.setValue(
+                current,
+                forKey: kCIInputImageKey
+            )
+
+            filter.setValue(
+                options.denoise,
+                forKey: "inputNoiseLevel"
+            )
+
+            filter.setValue(
+                0.35,
+                forKey: "inputSharpness"
+            )
+
+            if let result = filter.outputImage {
+                current = result
             }
         }
 
-        // metadati: copia gli originali, orientamento già applicato
-        var p: [String: Any] = props ?? [:]
-        let drop: [String] = [
-            kCGImagePropertyPixelWidth as String, kCGImagePropertyPixelHeight as String,
-            kCGImagePropertyDepth as String, kCGImagePropertyColorModel as String,
-            kCGImagePropertyHasAlpha as String, kCGImagePropertyProfileName as String,
+        // Nitidezza moderata
+        if options.sharpen > 0,
+           let filter = CIFilter(name: "CISharpenLuminance") {
+
+            filter.setValue(
+                current,
+                forKey: kCIInputImageKey
+            )
+
+            filter.setValue(
+                options.sharpen,
+                forKey: "inputSharpness"
+            )
+
+            if let result = filter.outputImage {
+                current = result
+            }
+        }
+
+        let context = CIContext(
+            options: [
+                .workingColorSpace: colorSpace,
+                .outputColorSpace: colorSpace,
+                .cacheIntermediates: false
+            ]
+        )
+
+        let rect = CGRect(
+            x: 0,
+            y: 0,
+            width: image.width,
+            height: image.height
+        )
+
+        return context.createCGImage(
+            current,
+            from: rect,
+            format: .RGBA8,
+            colorSpace: colorSpace
+        ) ?? image
+    }
+
+    // MARK: - Esportazione
+
+    nonisolated static func export(
+        _ image: RGBA8,
+        props: [String: Any]?,
+        options: HDROptions
+    ) -> Data? {
+
+        guard let colorSpace = CGColorSpace(
+            name: CGColorSpace.displayP3
+        ),
+        let context = CGContext(
+            data: image.p,
+            width: image.w,
+            height: image.h,
+            bitsPerComponent: 8,
+            bytesPerRow: image.w * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ),
+        let baseImage = context.makeImage() else {
+            return nil
+        }
+
+        // Elaborazione finale
+        let finalImage = enhance(
+            baseImage,
+            options: options,
+            colorSpace: colorSpace
+        )
+
+        // Conservazione metadati
+        var metadata = props ?? [:]
+
+        let keysToRemove: [String] = [
+            kCGImagePropertyPixelWidth as String,
+            kCGImagePropertyPixelHeight as String,
+            kCGImagePropertyDepth as String,
+            kCGImagePropertyColorModel as String,
+            kCGImagePropertyHasAlpha as String,
+            kCGImagePropertyProfileName as String,
             kCGImagePropertyMakerAppleDictionary as String
         ]
-        for k in drop { p.removeValue(forKey: k) }
-        p[kCGImagePropertyOrientation as String] = 1
-        if var tiff = p[kCGImagePropertyTIFFDictionary as String] as? [String: Any] {
-            tiff[kCGImagePropertyTIFFOrientation as String] = 1
-            p[kCGImagePropertyTIFFDictionary as String] = tiff
-        }
-        if var exif = p[kCGImagePropertyExifDictionary as String] as? [String: Any] {
-            exif[kCGImagePropertyExifPixelXDimension as String] = img.w
-            exif[kCGImagePropertyExifPixelYDimension as String] = img.h
-            p[kCGImagePropertyExifDictionary as String] = exif
-        }
-        p[kCGImageDestinationLossyCompressionQuality as String] = options.quality
 
-        let type = options.heif ? UTType.heic.identifier : UTType.jpeg.identifier
-        let out = NSMutableData()
-        guard let dest = CGImageDestinationCreateWithData(out, type as CFString, 1, nil) else { return nil }
-        CGImageDestinationAddImage(dest, outImg, p as CFDictionary)
-        guard CGImageDestinationFinalize(dest) else { return nil }
-        withExtendedLifetime(img) {}
-        return out as Data
+        for key in keysToRemove {
+            metadata.removeValue(forKey: key)
+        }
+
+        metadata[kCGImagePropertyOrientation as String] = 1
+
+        if var tiff = metadata[
+            kCGImagePropertyTIFFDictionary as String
+        ] as? [String: Any] {
+
+            tiff[kCGImagePropertyTIFFOrientation as String] = 1
+
+            metadata[
+                kCGImagePropertyTIFFDictionary as String
+            ] = tiff
+        }
+
+        if var exif = metadata[
+            kCGImagePropertyExifDictionary as String
+        ] as? [String: Any] {
+
+            exif[
+                kCGImagePropertyExifPixelXDimension as String
+            ] = image.w
+
+            exif[
+                kCGImagePropertyExifPixelYDimension as String
+            ] = image.h
+
+            metadata[
+                kCGImagePropertyExifDictionary as String
+            ] = exif
+        }
+
+        metadata[
+            kCGImageDestinationLossyCompressionQuality as String
+        ] = options.quality
+
+        // JPEG o HEIF
+        let type = options.heif
+            ? UTType.heic.identifier
+            : UTType.jpeg.identifier
+
+        let output = NSMutableData()
+
+        guard let destination = CGImageDestinationCreateWithData(
+            output,
+            type as CFString,
+            1,
+            nil
+        ) else {
+            return nil
+        }
+
+        CGImageDestinationAddImage(
+            destination,
+            finalImage,
+            metadata as CFDictionary
+        )
+
+        guard CGImageDestinationFinalize(destination) else {
+            return nil
+        }
+
+        return output as Data
     }
 }
