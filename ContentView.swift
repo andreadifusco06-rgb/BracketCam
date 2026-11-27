@@ -36,12 +36,15 @@ struct ContentView: View {
                         .frame(height: 90)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
-                Toggle("Salva anche i singoli scatti", isOn: $cam.saveSingles)
-                    .font(.footnote)
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 14).padding(.vertical, 8)
-                    .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
-                    .padding(.horizontal, 40)
+                VStack(spacing: 6) {
+                    Toggle("Salva anche i singoli scatti", isOn: $cam.saveSingles)
+                    Toggle("Salva in HEIF (altrimenti JPEG)", isOn: $cam.saveHEIF)
+                }
+                .font(.footnote)
+                .foregroundStyle(.white)
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12))
+                .padding(.horizontal, 40)
                 Button(action: { cam.capture() }) {
                     ZStack {
                         Circle().stroke(.white, lineWidth: 4).frame(width: 78, height: 78)

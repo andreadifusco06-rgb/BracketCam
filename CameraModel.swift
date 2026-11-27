@@ -4,8 +4,10 @@ import UIKit
 
 @MainActor
 final class CameraModel: NSObject, ObservableObject {
-    // Esposizioni del bracketing, in EV. Cambia qui se vuoi più o meno range.
+    // Esposizioni del bracketing, in EV. Se il dispositivo accetta 5 scatti si usa l'elenco largo
+    // (finestre + ombre), altrimenti quello a 3 scatti originale.
     let evSteps: [Float] = [-2, 0, 2]
+    let evStepsWide: [Float] = [-3, -1.5, 0, 1.5, 3]
 
     nonisolated(unsafe) let session = AVCaptureSession()
     private let output = AVCapturePhotoOutput()
@@ -17,6 +19,7 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var busy = false
     @Published var lastImage: UIImage?
     @Published var saveSingles = false
+    @Published var saveHEIF = false
 
     func start() async {
         guard await AVCaptureDevice.requestAccess(for: .video) else {
@@ -44,10 +47,36 @@ final class CameraModel: NSObject, ObservableObject {
         device = dev
     }
 
+    /// Blocca (o sblocca) il bilanciamento del bianco: senza il blocco i colori possono
+    /// cambiare tra uno scatto e l'altro della sequenza.
+    private func setWhiteBalanceLock(_ lock: Bool) {
+        guard let dev = device else { return }
+        do {
+            try dev.lockForConfiguration()
+            if lock {
+                if dev.isWhiteBalanceModeSupported(.locked) {
+                    var g = dev.deviceWhiteBalanceGains
+                    let m = dev.maxWhiteBalanceGain
+                    g.redGain = min(max(g.redGain, 1), m)
+                    g.greenGain = min(max(g.greenGain, 1), m)
+                    g.blueGain = min(max(g.blueGain, 1), m)
+                    dev.setWhiteBalanceModeLocked(with: g, completionHandler: nil)
+                }
+            } else if dev.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                dev.whiteBalanceMode = .continuousAutoWhiteBalance
+            }
+            dev.unlockForConfiguration()
+        } catch {
+            // se il blocco non riesce si scatta comunque con bilanciamento automatico
+        }
+    }
+
     func capture() {
         guard !busy, let dev = device else { return }
-        let biases = evSteps.map { min(max($0, dev.minExposureTargetBias), dev.maxExposureTargetBias) }
-        guard biases.count <= output.maxBracketedCapturePhotoCount else {
+        let maxCount = output.maxBracketedCapturePhotoCount
+        let wanted = (maxCount >= evStepsWide.count) ? evStepsWide : evSteps
+        let biases = wanted.map { min(max($0, dev.minExposureTargetBias), dev.maxExposureTargetBias) }
+        guard biases.count <= maxCount else {
             status = "Bracketing non supportato"
             return
         }
@@ -61,6 +90,7 @@ final class CameraModel: NSObject, ObservableObject {
         shots = []
         busy = true
         status = "Scatto… tieni fermo"
+        setWhiteBalanceLock(true)
         output.capturePhoto(with: settings, delegate: self)
     }
 
@@ -69,6 +99,7 @@ final class CameraModel: NSObject, ObservableObject {
     }
 
     fileprivate func finished() {
+        setWhiteBalanceLock(false)
         let captured = shots
         guard captured.count >= 2 else {
             status = "Scatto fallito, riprova"
@@ -77,8 +108,12 @@ final class CameraModel: NSObject, ObservableObject {
         }
         status = "Fusione in corso…"
         let singles = saveSingles
+        var options = HDROptions()
+        options.heif = saveHEIF
+        let opts = options
         Task.detached(priority: .userInitiated) {
-            let merged = Fusion.merge(captured)
+            // motore nuovo; se fallisce per qualunque motivo si ripiega sulla fusione originale
+            let merged = HDRPipeline.process(captured, options: opts) ?? Fusion.merge(captured)
             let ok = await CameraModel.save((merged.map { [$0] } ?? []) + (singles ? captured : []))
             await MainActor.run {
                 if let merged { self.lastImage = UIImage(data: merged) }
