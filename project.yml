@@ -1,4 +1,3 @@
-
 name: BracketCam
 
 options:
@@ -14,7 +13,9 @@ targets:
       - BracketCamApp.swift
       - ContentView.swift
       - CameraModel.swift
-      - Fusion.swift
+      - FusionLegacy.swift
+      - FusionCore.swift
+      - HDRPipeline.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: it.bracketcam.personal
