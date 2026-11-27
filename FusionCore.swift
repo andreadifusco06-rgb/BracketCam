@@ -1,4 +1,3 @@
-import Foundation
 
 // Motore di fusione HDR di BracketCam: Exposure Fusion di Mertens a piramide di Laplace,
 // allineamento MTB, deghosting prudente e finitura. Solo Foundation, nessuna dipendenza esterna.
